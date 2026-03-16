@@ -1,6 +1,6 @@
 """
 MegaSwift - Water Utility Civil Plan Takeoff Application
-V1.2
+V1.3
 
 DEPENDENCIES — install before running:
     pip install PyQt6 PyMuPDF ollama
@@ -941,6 +941,53 @@ class ChatPanel(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# Ollama Vision Helper
+# ---------------------------------------------------------------------------
+
+class OllamaVisionHelper:
+    """
+    Renders a region of a PDF page to PNG and sends it to a local
+    Ollama vision model (e.g. llava) for text-based analysis.
+
+    Usage:
+        helper = OllamaVisionHelper(model="llava", host="http://localhost:11434")
+        answer = helper.ask(fitz_page, clip_rect, question)
+
+    The caller is responsible for catching exceptions (Ollama not running,
+    model not pulled, etc.) and falling back gracefully.
+    """
+
+    def __init__(self, model: str, host: str):
+        if not OLLAMA_AVAILABLE:
+            raise ImportError("ollama package not installed. Run: pip install ollama")
+        self._model  = model
+        self._client = _ollama.Client(host=host)
+
+    def ask(self, fitz_page, clip: "fitz.Rect | None", question: str) -> str:
+        """
+        Render *clip* (or the whole page if None) to PNG bytes, send to
+        the vision model with *question*, and return the plain-text reply.
+        """
+        mat = fitz.Matrix(2, 2)   # 144 DPI — crisp enough for title block text
+        if clip is not None:
+            pix = fitz_page.get_pixmap(matrix=mat, clip=clip)
+        else:
+            pix = fitz_page.get_pixmap(matrix=mat)
+
+        img_bytes = pix.tobytes("png")
+
+        response = self._client.chat(
+            model=self._model,
+            messages=[{
+                "role":    "user",
+                "content": question,
+                "images":  [img_bytes],
+            }],
+        )
+        return response["message"]["content"].strip()
+
+
+# ---------------------------------------------------------------------------
 # Main Window
 # ---------------------------------------------------------------------------
 
@@ -1034,20 +1081,25 @@ class MainWindow(QMainWindow):
 
     _CONFIG_PATH = os.path.expanduser("~/.megaswift_config.json")
 
+    DEFAULT_VISION_MODEL = "llava"
+
     def _load_ollama_settings(self):
         """Load saved Ollama model/host from config file."""
         if os.path.exists(self._CONFIG_PATH):
             try:
                 with open(self._CONFIG_PATH) as f:
                     cfg = json.load(f)
-                self._ollama_model = cfg.get("ollama_model", ChatPanel.DEFAULT_MODEL)
-                self._ollama_host  = cfg.get("ollama_host",  ChatPanel.DEFAULT_HOST)
+                self._ollama_model        = cfg.get("ollama_model",        ChatPanel.DEFAULT_MODEL)
+                self._ollama_vision_model = cfg.get("ollama_vision_model", self.DEFAULT_VISION_MODEL)
+                self._ollama_host         = cfg.get("ollama_host",         ChatPanel.DEFAULT_HOST)
             except Exception:
-                self._ollama_model = ChatPanel.DEFAULT_MODEL
-                self._ollama_host  = ChatPanel.DEFAULT_HOST
+                self._ollama_model        = ChatPanel.DEFAULT_MODEL
+                self._ollama_vision_model = self.DEFAULT_VISION_MODEL
+                self._ollama_host         = ChatPanel.DEFAULT_HOST
         else:
-            self._ollama_model = ChatPanel.DEFAULT_MODEL
-            self._ollama_host  = ChatPanel.DEFAULT_HOST
+            self._ollama_model        = ChatPanel.DEFAULT_MODEL
+            self._ollama_vision_model = self.DEFAULT_VISION_MODEL
+            self._ollama_host         = ChatPanel.DEFAULT_HOST
 
     def _save_ollama_settings(self):
         try:
@@ -1055,8 +1107,9 @@ class MainWindow(QMainWindow):
             if os.path.exists(self._CONFIG_PATH):
                 with open(self._CONFIG_PATH) as f:
                     cfg = json.load(f)
-            cfg["ollama_model"] = self._ollama_model
-            cfg["ollama_host"]  = self._ollama_host
+            cfg["ollama_model"]        = self._ollama_model
+            cfg["ollama_vision_model"] = self._ollama_vision_model
+            cfg["ollama_host"]         = self._ollama_host
             with open(self._CONFIG_PATH, "w") as f:
                 json.dump(cfg, f, indent=2)
         except Exception as exc:
@@ -1069,19 +1122,26 @@ class MainWindow(QMainWindow):
         )
         if not ok:
             return
+        vision_model, ok = QInputDialog.getText(
+            self, "Ollama Settings", "Vision model name for Auto Name / Auto Scale (e.g. llava):",
+            text=self._ollama_vision_model,
+        )
+        if not ok:
+            return
         host, ok = QInputDialog.getText(
             self, "Ollama Settings", "Ollama server URL:",
             text=self._ollama_host,
         )
         if not ok:
             return
-        self._ollama_model = model.strip() or ChatPanel.DEFAULT_MODEL
-        self._ollama_host  = host.strip()  or ChatPanel.DEFAULT_HOST
+        self._ollama_model        = model.strip()        or ChatPanel.DEFAULT_MODEL
+        self._ollama_vision_model = vision_model.strip() or self.DEFAULT_VISION_MODEL
+        self._ollama_host         = host.strip()         or ChatPanel.DEFAULT_HOST
         self.chat_panel.set_model(self._ollama_model)
         self.chat_panel.set_host(self._ollama_host)
         self._save_ollama_settings()
         self.status.showMessage(
-            f"Ollama: model={self._ollama_model}  host={self._ollama_host}"
+            f"Ollama: chat={self._ollama_model}  vision={self._ollama_vision_model}  host={self._ollama_host}"
         )
 
     # ------------------------------------------------------------------
@@ -1425,6 +1485,10 @@ class MainWindow(QMainWindow):
         doc = self._pdf_doc
         updated = 0
 
+        # Build vision helper once — reused across pages if needed
+        vision = None
+        vision_error = None
+
         for i, page_data in enumerate(self._project["pages"]):
             page = doc[i]
             w = page.rect.width
@@ -1445,11 +1509,45 @@ class MainWindow(QMainWindow):
                 page_data["name"] = text
                 self.project_panel.update_page_name(i, text)
                 updated += 1
+                continue
+
+            # --- Ollama Vision fallback for image-only pages ---
+            if not OLLAMA_AVAILABLE or vision_error:
+                continue
+
+            self.status.showMessage(f"Auto Name: page {i + 1} — trying vision fallback…")
+            QApplication.processEvents()
+
+            try:
+                if vision is None:
+                    vision = OllamaVisionHelper(self._ollama_vision_model, self._ollama_host)
+
+                wider_clip = fitz.Rect(w * 0.85, h * 0.90, w, h)
+                answer = vision.ask(
+                    page,
+                    wider_clip,
+                    "This is a cropped corner of a civil engineering drawing title block. "
+                    "What is the sheet number or sheet name printed here (e.g. C-1, W-3, "
+                    "Sheet 1 of 12)? Reply with ONLY the sheet identifier, nothing else. "
+                    "If you cannot read one, reply NONE."
+                )
+                if answer.upper() != "NONE" and answer:
+                    page_data["name"] = answer
+                    self.project_panel.update_page_name(i, answer)
+                    updated += 1
+
+            except Exception as exc:
+                vision_error = str(exc)
 
         if updated:
             msg = f"Auto Name: updated {updated} of {len(self._project['pages'])} pages."
         else:
-            msg = "Auto Name: no sheet identifiers found in embedded text."
+            msg = "Auto Name: no sheet identifiers found."
+
+        if not OLLAMA_AVAILABLE:
+            msg += " (Install 'ollama' package to enable vision fallback.)"
+        elif vision_error:
+            msg += f" Vision error: {vision_error}"
 
         self.status.showMessage(msg)
 
@@ -1482,11 +1580,37 @@ class MainWindow(QMainWindow):
         feet_per_inch = self._parse_scale_text(text)
 
         if feet_per_inch is None:
-            self.status.showMessage(
-                "Auto Scale: no scale found in embedded text. "
-                "Try setting the scale manually with 'Set Scale'."
-            )
-            return
+            # --- Ollama Vision fallback ---
+            if not OLLAMA_AVAILABLE:
+                self.status.showMessage(
+                    "Auto Scale: no scale found in embedded text. "
+                    "Install 'ollama' package to enable vision fallback."
+                )
+                return
+            self.status.showMessage("Auto Scale: trying vision fallback…")
+            QApplication.processEvents()
+            try:
+                vision = OllamaVisionHelper(self._ollama_vision_model, self._ollama_host)
+                answer = vision.ask(
+                    page,
+                    clip,
+                    "This is a cropped section of a civil engineering drawing title block. "
+                    "What is the drawing scale? Reply with ONLY the scale expression, "
+                    "for example: 1\" = 20' or 1:240. If no scale is visible, reply NONE."
+                )
+                feet_per_inch = self._parse_scale_text(answer)
+                if feet_per_inch is None:
+                    self.status.showMessage(
+                        f"Auto Scale: vision replied '{answer}' — could not parse a scale. "
+                        "Try setting the scale manually with 'Set Scale'."
+                    )
+                    return
+            except Exception as exc:
+                self.status.showMessage(
+                    f"Auto Scale: vision error — {exc}. "
+                    "Try setting the scale manually."
+                )
+                return
 
         feet_per_pixel = feet_per_inch / PIXELS_PER_DRAWING_INCH
 
