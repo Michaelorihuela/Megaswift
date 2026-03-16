@@ -1,9 +1,9 @@
 """
 MegaSwift - Water Utility Civil Plan Takeoff Application
-V1.0
+V1.1
 
 DEPENDENCIES — install before running:
-    pip install PyQt6 PyMuPDF anthropic
+    pip install PyQt6 PyMuPDF
 
 What those packages are:
   PyQt6      — A professional-grade desktop GUI framework for Python, built on top
@@ -11,9 +11,6 @@ What those packages are:
                 windows, buttons, toolbars, scroll areas, and drawing capabilities.
   PyMuPDF    — A fast Python library for reading and rendering PDF files. It converts
                 PDF pages into images we can display and interact with.
-  anthropic  — The official Anthropic Python SDK. Used as a fallback for Auto Scale
-                and Auto Name when embedded PDF text extraction finds nothing (e.g.
-                scanned/image-only PDFs). Requires ANTHROPIC_API_KEY env var.
 """
 
 import sys
@@ -21,14 +18,6 @@ import json
 import os
 import math
 import re
-import base64
-
-# Optional — app works without it, but Auto Scale / Auto Name AI fallback requires it
-try:
-    import anthropic as _anthropic
-    ANTHROPIC_AVAILABLE = True
-except ImportError:
-    ANTHROPIC_AVAILABLE = False
 
 # Tell Qt where to find its platform plugins (fixes "cocoa not found" on macOS with Anaconda)
 os.environ.setdefault(
@@ -53,63 +42,6 @@ from PyQt6.QtGui import (
 # ---------------------------------------------------------------------------
 # Claude Vision Helper
 # ---------------------------------------------------------------------------
-
-class ClaudeVisionHelper:
-    """
-    Sends a rendered PDF region to Claude Vision and returns a text answer.
-
-    Usage:
-        helper = ClaudeVisionHelper()           # raises if SDK not installed
-        answer = helper.ask(fitz_page, clip_rect, question)
-
-    The caller is responsible for catching exceptions (network errors, API
-    errors, missing API key) and falling back gracefully.
-    """
-
-    MODEL = "claude-opus-4-6"
-
-    def __init__(self):
-        if not ANTHROPIC_AVAILABLE:
-            raise ImportError(
-                "anthropic package not installed. Run: pip install anthropic"
-            )
-        # Will raise anthropic.AuthenticationError later if key is missing/wrong
-        self._client = _anthropic.Anthropic()
-
-    def ask(self, fitz_page, clip: "fitz.Rect | None", question: str) -> str:
-        """
-        Render *clip* (or the whole page if None) to a PNG, send it to Claude
-        with *question*, and return Claude's plain-text response.
-        """
-        # Render the region at 2× PDF points (144 DPI effective)
-        mat = fitz.Matrix(2, 2)
-        if clip is not None:
-            pix = fitz_page.get_pixmap(matrix=mat, clip=clip)
-        else:
-            pix = fitz_page.get_pixmap(matrix=mat)
-
-        img_b64 = base64.standard_b64encode(pix.tobytes("png")).decode()
-
-        with self._client.messages.stream(
-            model=self.MODEL,
-            max_tokens=256,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/png",
-                            "data": img_b64,
-                        },
-                    },
-                    {"type": "text", "text": question},
-                ],
-            }],
-        ) as stream:
-            return stream.get_final_message().content[0].text.strip()
-
 
 # ---------------------------------------------------------------------------
 # Endpoint Handle
@@ -787,202 +719,6 @@ class WelcomeScreen(QWidget):
 
 
 # ---------------------------------------------------------------------------
-# Chat Panel (Claude conversation sidebar)
-# ---------------------------------------------------------------------------
-
-class ChatWorker(QObject):
-    """Runs a streaming Claude API call on a background thread."""
-    token_received = pyqtSignal(str)
-    finished       = pyqtSignal()
-    error          = pyqtSignal(str)
-
-    def __init__(self, messages: list, system_prompt: str):
-        super().__init__()
-        self._messages = messages
-        self._system   = system_prompt
-
-    @pyqtSlot()
-    def run(self):
-        try:
-            client = _anthropic.Anthropic()
-            with client.messages.stream(
-                model="claude-opus-4-6",
-                max_tokens=1024,
-                system=self._system,
-                messages=self._messages,
-            ) as stream:
-                for text in stream.text_stream:
-                    self.token_received.emit(text)
-            self.finished.emit()
-        except Exception as exc:
-            self.error.emit(str(exc))
-
-
-class ChatPanel(QWidget):
-    """
-    Collapsible right-side chat panel.  Sends the user's message to Claude
-    along with a system prompt that describes the current page context.
-    Responses stream in token-by-token.
-    """
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setMinimumWidth(260)
-        self.setMaximumWidth(420)
-
-        self._history: list[dict] = []   # [{"role": ..., "content": ...}, ...]
-        self._page_context = ""          # set by MainWindow when page changes
-        self._worker  = None
-        self._thread  = None
-        self._bot_buf = ""               # accumulates current streaming reply
-
-        self._build_ui()
-
-    def _build_ui(self):
-        root = QVBoxLayout(self)
-        root.setContentsMargins(4, 4, 4, 4)
-        root.setSpacing(4)
-
-        # Header
-        header = QHBoxLayout()
-        title = QLabel("Claude Chat")
-        title.setStyleSheet("font-weight: bold; font-size: 13px;")
-        header.addWidget(title)
-        header.addStretch()
-        clear_btn = QPushButton("Clear")
-        clear_btn.setFixedWidth(50)
-        clear_btn.clicked.connect(self._clear)
-        header.addWidget(clear_btn)
-        root.addLayout(header)
-
-        # Conversation display
-        from PyQt6.QtWidgets import QTextEdit as _QTE
-        self._display = _QTE()
-        self._display.setReadOnly(True)
-        self._display.setStyleSheet(
-            "background:#1e1e1e; color:#d4d4d4; font-size:12px; border:1px solid #444;"
-        )
-        root.addWidget(self._display, stretch=1)
-
-        # Input row
-        input_row = QHBoxLayout()
-        input_row.setSpacing(4)
-
-        self._input = QLabel.__new__(QLabel)   # placeholder — replaced below
-        from PyQt6.QtWidgets import QTextEdit as _QTE2
-        self._input = _QTE2()
-        self._input.setFixedHeight(64)
-        self._input.setPlaceholderText("Ask Claude about this plan…")
-        self._input.setStyleSheet("font-size:12px;")
-        # Ctrl+Enter sends
-        self._input.installEventFilter(self)
-        input_row.addWidget(self._input)
-
-        send_btn = QPushButton("Send")
-        send_btn.setFixedWidth(52)
-        send_btn.clicked.connect(self._send)
-        input_row.addWidget(send_btn)
-        root.addLayout(input_row)
-
-        hint = QLabel("Ctrl+Enter to send")
-        hint.setStyleSheet("color:#666; font-size:10px;")
-        root.addWidget(hint)
-
-    def eventFilter(self, obj, event):
-        from PyQt6.QtCore import QEvent
-        from PyQt6.QtGui import QKeyEvent
-        if obj is self._input and event.type() == QEvent.Type.KeyPress:
-            ke = event
-            if (ke.key() == Qt.Key.Key_Return and
-                    ke.modifiers() & Qt.KeyboardModifier.ControlModifier):
-                self._send()
-                return True
-        return super().eventFilter(obj, event)
-
-    def set_page_context(self, context: str):
-        self._page_context = context
-
-    def _system_prompt(self) -> str:
-        base = (
-            "You are an expert civil engineering plan reviewer embedded inside MegaSwift, "
-            "a water utility takeoff application. Answer questions concisely. "
-            "Use plain text — no markdown headers or bullet symbols unless asked."
-        )
-        if self._page_context:
-            base += f"\n\nCurrent page context: {self._page_context}"
-        return base
-
-    def _append(self, role: str, text: str):
-        """Append a labelled block to the display."""
-        from PyQt6.QtGui import QTextCursor
-        cursor = self._display.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        self._display.setTextCursor(cursor)
-
-        if role == "user":
-            self._display.append(f"\n<b>You:</b> {text}")
-        elif role == "assistant_start":
-            self._display.append("\n<b>Claude:</b> ")
-        # token-by-token streaming — just insert at end without a newline
-        elif role == "token":
-            cursor = self._display.textCursor()
-            cursor.movePosition(QTextCursor.MoveOperation.End)
-            cursor.insertText(text)
-            self._display.setTextCursor(cursor)
-        elif role == "error":
-            self._display.append(f"\n<span style='color:#f88;'>Error: {text}</span>")
-
-        self._display.ensureCursorVisible()
-
-    def _send(self):
-        if not ANTHROPIC_AVAILABLE:
-            self._append("error", "anthropic package not installed. Run: pip install anthropic")
-            return
-
-        text = self._input.toPlainText().strip()
-        if not text:
-            return
-        if self._thread and self._thread.isRunning():
-            return  # already waiting for a reply
-
-        self._input.clear()
-        self._history.append({"role": "user", "content": text})
-        self._append("user", text)
-        self._append("assistant_start", "")
-        self._bot_buf = ""
-
-        self._worker = ChatWorker(list(self._history), self._system_prompt())
-        self._thread = QThread()
-        self._worker.moveToThread(self._thread)
-        self._thread.started.connect(self._worker.run)
-        self._worker.token_received.connect(self._on_token)
-        self._worker.finished.connect(self._on_finished)
-        self._worker.error.connect(self._on_error)
-        self._thread.start()
-
-    @pyqtSlot(str)
-    def _on_token(self, token: str):
-        self._bot_buf += token
-        self._append("token", token)
-
-    @pyqtSlot()
-    def _on_finished(self):
-        self._history.append({"role": "assistant", "content": self._bot_buf})
-        self._thread.quit()
-        self._thread.wait()
-
-    @pyqtSlot(str)
-    def _on_error(self, msg: str):
-        self._append("error", msg)
-        self._thread.quit()
-        self._thread.wait()
-
-    def _clear(self):
-        self._history.clear()
-        self._display.clear()
-
-
-# ---------------------------------------------------------------------------
 # Main Window
 # ---------------------------------------------------------------------------
 
@@ -1001,7 +737,6 @@ class MainWindow(QMainWindow):
         self._project_path = None
         self._pending_page = None
 
-        MainWindow._load_api_key()
         self._build_ui()
         self._build_menu()
         self._build_toolbar()
@@ -1054,62 +789,13 @@ class MainWindow(QMainWindow):
         self.viewer = PDFViewer()
         self.viewer.scale_set.connect(self._on_scale_set)
 
-        self.chat_panel = ChatPanel()
-
         splitter.addWidget(self.project_panel)
         splitter.addWidget(self.viewer)
-        splitter.addWidget(self.chat_panel)
         splitter.setStretchFactor(1, 1)   # viewer gets all extra space
-        # Start with chat panel collapsed — user can drag it open
-        splitter.setSizes([220, 900, 0])
+        splitter.setSizes([220, 900])
 
         layout.addWidget(splitter)
         self.stack.addWidget(workspace)
-
-    # ------------------------------------------------------------------
-    # API key persistence
-    # ------------------------------------------------------------------
-
-    _CONFIG_PATH = os.path.expanduser("~/.megaswift_config.json")
-
-    @classmethod
-    def _load_api_key(cls):
-        """Load saved API key into the environment (called at startup)."""
-        if os.path.exists(cls._CONFIG_PATH):
-            try:
-                with open(cls._CONFIG_PATH) as f:
-                    cfg = json.load(f)
-                key = cfg.get("anthropic_api_key", "")
-                if key:
-                    os.environ["ANTHROPIC_API_KEY"] = key
-            except Exception:
-                pass
-
-    def _set_api_key(self):
-        current = os.environ.get("ANTHROPIC_API_KEY", "")
-        key, ok = QInputDialog.getText(
-            self, "Anthropic API Key",
-            "Paste your Anthropic API key (from console.anthropic.com).\n"
-            "It will be saved to ~/.megaswift_config.json.\n\nAPI Key:",
-            text=current,
-        )
-        if not ok:
-            return
-        key = key.strip()
-        os.environ["ANTHROPIC_API_KEY"] = key
-        try:
-            cfg = {}
-            if os.path.exists(self._CONFIG_PATH):
-                with open(self._CONFIG_PATH) as f:
-                    cfg = json.load(f)
-            cfg["anthropic_api_key"] = key
-            with open(self._CONFIG_PATH, "w") as f:
-                json.dump(cfg, f, indent=2)
-            self.status.showMessage("API key saved to ~/.megaswift_config.json")
-        except Exception as exc:
-            QMessageBox.warning(self, "Save Failed", str(exc))
-
-    # ------------------------------------------------------------------
 
     def _build_menu(self):
         menubar = self.menuBar()
@@ -1135,13 +821,6 @@ class MainWindow(QMainWindow):
         save_as_action = QAction("Save Project As...", self)
         save_as_action.triggered.connect(self._save_project_as)
         file_menu.addAction(save_as_action)
-
-        file_menu.addSeparator()
-
-        api_key_action = QAction("Set API Key…", self)
-        api_key_action.setToolTip("Save your Anthropic API key for Auto Scale / Auto Name AI fallback")
-        api_key_action.triggered.connect(self._set_api_key)
-        file_menu.addAction(api_key_action)
 
     def _build_toolbar(self):
         toolbar = QToolBar("Tools")
@@ -1187,26 +866,6 @@ class MainWindow(QMainWindow):
         )
         auto_scale_btn.clicked.connect(self._auto_scale_page)
         toolbar.addWidget(auto_scale_btn)
-
-        toolbar.addSeparator()
-
-        self.chat_btn = QPushButton("Chat")
-        self.chat_btn.setCheckable(True)
-        self.chat_btn.setToolTip("Toggle Claude chat panel")
-        self.chat_btn.clicked.connect(self._toggle_chat)
-        toolbar.addWidget(self.chat_btn)
-
-    def _toggle_chat(self):
-        splitter = self.chat_panel.parent()
-        if not isinstance(splitter, QSplitter):
-            return
-        sizes = splitter.sizes()
-        if sizes[2] < 10:
-            splitter.setSizes([sizes[0], sizes[1] - 320, 320])
-            self.chat_btn.setChecked(True)
-        else:
-            splitter.setSizes([sizes[0], sizes[1] + sizes[2], 0])
-            self.chat_btn.setChecked(False)
 
     def _build_statusbar(self):
         self.status = QStatusBar()
@@ -1408,15 +1067,6 @@ class MainWindow(QMainWindow):
             f"Viewing: {page_name}  |  Drag endpoints to adjust  •  Click to select  •  Delete to remove"
         )
 
-        # Update chat context so Claude knows which page is open
-        project_name = self._project.get("name", "Unknown Project") if self._project else ""
-        scale = self.viewer.get_scale()
-        scale_str = f"{scale:.6f} ft/px" if scale else "not set"
-        self.chat_panel.set_page_context(
-            f"Project: {project_name}  |  Page {page_index + 1} of "
-            f"{len(self._project['pages'])}: '{page_name}'  |  Scale: {scale_str}"
-        )
-
     def _rename_page(self, index: int):
         if not self._project:
             return
@@ -1450,10 +1100,6 @@ class MainWindow(QMainWindow):
         doc = self._pdf_doc
         updated = 0
 
-        # Build Claude helper once if we might need it
-        claude = None
-        claude_error = None
-
         for i, page_data in enumerate(self._project["pages"]):
             page = doc[i]
             w = page.rect.width
@@ -1474,52 +1120,11 @@ class MainWindow(QMainWindow):
                 page_data["name"] = text
                 self.project_panel.update_page_name(i, text)
                 updated += 1
-                continue
-
-            # --- Claude Vision fallback for this page ---
-            if not ANTHROPIC_AVAILABLE:
-                continue  # skip silently; summary message below explains
-
-            if claude_error:
-                continue  # don't retry after a previous API error
-
-            self.status.showMessage(
-                f"Auto Name: page {i + 1} — trying Claude Vision fallback…"
-            )
-            QApplication.processEvents()
-
-            try:
-                if claude is None:
-                    claude = ClaudeVisionHelper()
-
-                # Send a slightly larger clip (bottom 10%, right 15%) so Claude
-                # has enough context to read the sheet number clearly
-                wider_clip = fitz.Rect(w * 0.85, h * 0.90, w, h)
-                answer = claude.ask(
-                    page,
-                    wider_clip,
-                    "This is a cropped corner of a civil engineering drawing title block. "
-                    "What is the sheet number or sheet name printed here (e.g. C-1, W-3, "
-                    "Sheet 1 of 12)? Reply with ONLY the sheet identifier, nothing else. "
-                    "If you cannot read one, reply NONE."
-                )
-                if answer.upper() != "NONE" and answer:
-                    page_data["name"] = answer
-                    self.project_panel.update_page_name(i, answer)
-                    updated += 1
-
-            except Exception as exc:
-                claude_error = str(exc)
 
         if updated:
             msg = f"Auto Name: updated {updated} of {len(self._project['pages'])} pages."
         else:
-            msg = "Auto Name: no sheet identifiers found."
-
-        if not ANTHROPIC_AVAILABLE:
-            msg += " (Install 'anthropic' for AI fallback on image-only PDFs.)"
-        elif claude_error:
-            msg += f" Claude Vision error: {claude_error}"
+            msg = "Auto Name: no sheet identifiers found in embedded text."
 
         self.status.showMessage(msg)
 
@@ -1552,37 +1157,11 @@ class MainWindow(QMainWindow):
         feet_per_inch = self._parse_scale_text(text)
 
         if feet_per_inch is None:
-            # --- Claude Vision fallback ---
-            if not ANTHROPIC_AVAILABLE:
-                self.status.showMessage(
-                    "Auto Scale: no scale found in text. "
-                    "Install 'anthropic' package to enable AI fallback."
-                )
-                return
-            self.status.showMessage("Auto Scale: trying Claude Vision fallback…")
-            QApplication.processEvents()
-            try:
-                helper = ClaudeVisionHelper()
-                answer = helper.ask(
-                    page,
-                    clip,
-                    "This is a cropped section of a civil engineering drawing title block. "
-                    "What is the drawing scale? Reply with ONLY the scale expression, "
-                    "for example: 1\" = 20' or 1:240. If no scale is visible, reply NONE."
-                )
-                feet_per_inch = self._parse_scale_text(answer)
-                if feet_per_inch is None:
-                    self.status.showMessage(
-                        f"Auto Scale: Claude replied '{answer}' — could not parse a scale. "
-                        "Try setting the scale manually with 'Set Scale'."
-                    )
-                    return
-            except Exception as exc:
-                self.status.showMessage(
-                    f"Auto Scale: Claude Vision error — {exc}. "
-                    "Try setting the scale manually."
-                )
-                return
+            self.status.showMessage(
+                "Auto Scale: no scale found in embedded text. "
+                "Try setting the scale manually with 'Set Scale'."
+            )
+            return
 
         feet_per_pixel = feet_per_inch / PIXELS_PER_DRAWING_INCH
 
