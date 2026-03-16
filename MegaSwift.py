@@ -1,9 +1,9 @@
 """
 MegaSwift - Water Utility Civil Plan Takeoff Application
-V1.1
+V1.2
 
 DEPENDENCIES — install before running:
-    pip install PyQt6 PyMuPDF
+    pip install PyQt6 PyMuPDF ollama
 
 What those packages are:
   PyQt6      — A professional-grade desktop GUI framework for Python, built on top
@@ -11,6 +11,8 @@ What those packages are:
                 windows, buttons, toolbars, scroll areas, and drawing capabilities.
   PyMuPDF    — A fast Python library for reading and rendering PDF files. It converts
                 PDF pages into images we can display and interact with.
+  ollama     — Python client for Ollama, the local LLM runner. Powers the chat panel.
+                Requires Ollama to be installed and running (https://ollama.com).
 """
 
 import sys
@@ -18,6 +20,13 @@ import json
 import os
 import math
 import re
+
+# Optional — app works without it, but the Chat panel requires it
+try:
+    import ollama as _ollama
+    OLLAMA_AVAILABLE = True
+except ImportError:
+    OLLAMA_AVAILABLE = False
 
 # Tell Qt where to find its platform plugins (fixes "cocoa not found" on macOS with Anaconda)
 os.environ.setdefault(
@@ -38,10 +47,6 @@ from PyQt6.QtGui import (
     QPixmap, QImage, QPainter, QPen, QColor, QAction, QKeySequence, QFont, QBrush
 )
 
-
-# ---------------------------------------------------------------------------
-# Claude Vision Helper
-# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Endpoint Handle
@@ -719,6 +724,223 @@ class WelcomeScreen(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# Chat Panel (Ollama conversation sidebar)
+# ---------------------------------------------------------------------------
+
+class OllamaChatWorker(QObject):
+    """
+    Runs a streaming Ollama chat call on a background thread.
+    Emits tokens as they arrive so the UI can display them live.
+    """
+    token_received = pyqtSignal(str)
+    finished       = pyqtSignal()
+    error          = pyqtSignal(str)
+
+    def __init__(self, messages: list, model: str, host: str):
+        super().__init__()
+        self._messages = messages
+        self._model    = model
+        self._host     = host
+
+    @pyqtSlot()
+    def run(self):
+        try:
+            client = _ollama.Client(host=self._host)
+            stream = client.chat(
+                model=self._model,
+                messages=self._messages,
+                stream=True,
+            )
+            for chunk in stream:
+                token = chunk["message"]["content"]
+                if token:
+                    self.token_received.emit(token)
+            self.finished.emit()
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+class ChatPanel(QWidget):
+    """
+    Collapsible right-side chat panel backed by a local Ollama model.
+    Streams responses token-by-token. Model and host are configurable.
+    """
+
+    DEFAULT_MODEL = "llama3.2"
+    DEFAULT_HOST  = "http://localhost:11434"
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumWidth(260)
+        self.setMaximumWidth(420)
+
+        self._history: list[dict] = []
+        self._page_context = ""
+        self._worker  = None
+        self._thread  = None
+        self._bot_buf = ""
+
+        self.model = self.DEFAULT_MODEL
+        self.host  = self.DEFAULT_HOST
+
+        self._build_ui()
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(4, 4, 4, 4)
+        root.setSpacing(4)
+
+        # Header row
+        header = QHBoxLayout()
+        title = QLabel("Ollama Chat")
+        title.setStyleSheet("font-weight: bold; font-size: 13px;")
+        header.addWidget(title)
+        header.addStretch()
+        clear_btn = QPushButton("Clear")
+        clear_btn.setFixedWidth(50)
+        clear_btn.clicked.connect(self._clear)
+        header.addWidget(clear_btn)
+        root.addLayout(header)
+
+        # Model label
+        self._model_label = QLabel(f"Model: {self.model}")
+        self._model_label.setStyleSheet("color:#888; font-size:10px;")
+        root.addWidget(self._model_label)
+
+        # Conversation display
+        from PyQt6.QtWidgets import QTextEdit as _QTE
+        self._display = _QTE()
+        self._display.setReadOnly(True)
+        self._display.setStyleSheet(
+            "background:#1e1e1e; color:#d4d4d4; font-size:12px; border:1px solid #444;"
+        )
+        root.addWidget(self._display, stretch=1)
+
+        # Input row
+        input_row = QHBoxLayout()
+        input_row.setSpacing(4)
+        from PyQt6.QtWidgets import QTextEdit as _QTE2
+        self._input = _QTE2()
+        self._input.setFixedHeight(64)
+        self._input.setPlaceholderText("Ask about this plan…")
+        self._input.setStyleSheet("font-size:12px;")
+        self._input.installEventFilter(self)
+        input_row.addWidget(self._input)
+        send_btn = QPushButton("Send")
+        send_btn.setFixedWidth(52)
+        send_btn.clicked.connect(self._send)
+        input_row.addWidget(send_btn)
+        root.addLayout(input_row)
+
+        hint = QLabel("Ctrl+Enter to send")
+        hint.setStyleSheet("color:#666; font-size:10px;")
+        root.addWidget(hint)
+
+    def eventFilter(self, obj, event):
+        from PyQt6.QtCore import QEvent
+        if obj is self._input and event.type() == QEvent.Type.KeyPress:
+            if (event.key() == Qt.Key.Key_Return and
+                    event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+                self._send()
+                return True
+        return super().eventFilter(obj, event)
+
+    def set_page_context(self, context: str):
+        self._page_context = context
+
+    def set_model(self, model: str):
+        self.model = model
+        self._model_label.setText(f"Model: {model}")
+
+    def set_host(self, host: str):
+        self.host = host
+
+    def _system_prompt(self) -> str:
+        base = (
+            "You are an expert civil engineering plan reviewer embedded inside MegaSwift, "
+            "a water utility takeoff application. Answer questions concisely. "
+            "Use plain text — no markdown headers or bullet symbols unless asked."
+        )
+        if self._page_context:
+            base += f"\n\nCurrent page context: {self._page_context}"
+        return base
+
+    def _append(self, role: str, text: str):
+        from PyQt6.QtGui import QTextCursor
+        cursor = self._display.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self._display.setTextCursor(cursor)
+
+        if role == "user":
+            self._display.append(f"\n<b>You:</b> {text}")
+        elif role == "assistant_start":
+            self._display.append(f"\n<b>{self.model}:</b> ")
+        elif role == "token":
+            cursor = self._display.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            cursor.insertText(text)
+            self._display.setTextCursor(cursor)
+        elif role == "error":
+            self._display.append(f"\n<span style='color:#f88;'>Error: {text}</span>")
+
+        self._display.ensureCursorVisible()
+
+    def _send(self):
+        if not OLLAMA_AVAILABLE:
+            self._append("error", "ollama package not installed. Run: pip install ollama")
+            return
+
+        text = self._input.toPlainText().strip()
+        if not text:
+            return
+        if self._thread and self._thread.isRunning():
+            return
+
+        self._input.clear()
+        self._history.append({"role": "user", "content": text})
+        self._append("user", text)
+        self._append("assistant_start", "")
+        self._bot_buf = ""
+
+        messages = [{"role": "system", "content": self._system_prompt()}] + self._history
+
+        self._worker = OllamaChatWorker(messages, self.model, self.host)
+        self._thread = QThread()
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.token_received.connect(self._on_token)
+        self._worker.finished.connect(self._on_finished)
+        self._worker.error.connect(self._on_error)
+        self._thread.start()
+
+    @pyqtSlot(str)
+    def _on_token(self, token: str):
+        self._bot_buf += token
+        self._append("token", token)
+
+    @pyqtSlot()
+    def _on_finished(self):
+        self._history.append({"role": "assistant", "content": self._bot_buf})
+        self._thread.quit()
+        self._thread.wait()
+
+    @pyqtSlot(str)
+    def _on_error(self, msg: str):
+        if "connection refused" in msg.lower() or "connect" in msg.lower():
+            self._append("error", "Cannot reach Ollama. Is it running? Try: ollama serve")
+        elif "model" in msg.lower() and "not found" in msg.lower():
+            self._append("error", f"Model '{self.model}' not found. Run: ollama pull {self.model}")
+        else:
+            self._append("error", msg)
+        self._thread.quit()
+        self._thread.wait()
+
+    def _clear(self):
+        self._history.clear()
+        self._display.clear()
+
+
+# ---------------------------------------------------------------------------
 # Main Window
 # ---------------------------------------------------------------------------
 
@@ -737,6 +959,7 @@ class MainWindow(QMainWindow):
         self._project_path = None
         self._pending_page = None
 
+        self._load_ollama_settings()
         self._build_ui()
         self._build_menu()
         self._build_toolbar()
@@ -789,13 +1012,79 @@ class MainWindow(QMainWindow):
         self.viewer = PDFViewer()
         self.viewer.scale_set.connect(self._on_scale_set)
 
+        self.chat_panel = ChatPanel()
+
         splitter.addWidget(self.project_panel)
         splitter.addWidget(self.viewer)
+        splitter.addWidget(self.chat_panel)
         splitter.setStretchFactor(1, 1)   # viewer gets all extra space
-        splitter.setSizes([220, 900])
+        # Start with chat panel collapsed — user can drag it open
+        splitter.setSizes([220, 900, 0])
 
         layout.addWidget(splitter)
         self.stack.addWidget(workspace)
+
+        # Apply persisted Ollama settings to the chat panel
+        self.chat_panel.set_model(self._ollama_model)
+        self.chat_panel.set_host(self._ollama_host)
+
+    # ------------------------------------------------------------------
+    # Ollama settings persistence
+    # ------------------------------------------------------------------
+
+    _CONFIG_PATH = os.path.expanduser("~/.megaswift_config.json")
+
+    def _load_ollama_settings(self):
+        """Load saved Ollama model/host from config file."""
+        if os.path.exists(self._CONFIG_PATH):
+            try:
+                with open(self._CONFIG_PATH) as f:
+                    cfg = json.load(f)
+                self._ollama_model = cfg.get("ollama_model", ChatPanel.DEFAULT_MODEL)
+                self._ollama_host  = cfg.get("ollama_host",  ChatPanel.DEFAULT_HOST)
+            except Exception:
+                self._ollama_model = ChatPanel.DEFAULT_MODEL
+                self._ollama_host  = ChatPanel.DEFAULT_HOST
+        else:
+            self._ollama_model = ChatPanel.DEFAULT_MODEL
+            self._ollama_host  = ChatPanel.DEFAULT_HOST
+
+    def _save_ollama_settings(self):
+        try:
+            cfg = {}
+            if os.path.exists(self._CONFIG_PATH):
+                with open(self._CONFIG_PATH) as f:
+                    cfg = json.load(f)
+            cfg["ollama_model"] = self._ollama_model
+            cfg["ollama_host"]  = self._ollama_host
+            with open(self._CONFIG_PATH, "w") as f:
+                json.dump(cfg, f, indent=2)
+        except Exception as exc:
+            QMessageBox.warning(self, "Save Failed", str(exc))
+
+    def _configure_ollama(self):
+        model, ok = QInputDialog.getText(
+            self, "Ollama Settings", "Chat model name (e.g. llama3.2, mistral):",
+            text=self._ollama_model,
+        )
+        if not ok:
+            return
+        host, ok = QInputDialog.getText(
+            self, "Ollama Settings", "Ollama server URL:",
+            text=self._ollama_host,
+        )
+        if not ok:
+            return
+        self._ollama_model = model.strip() or ChatPanel.DEFAULT_MODEL
+        self._ollama_host  = host.strip()  or ChatPanel.DEFAULT_HOST
+        self.chat_panel.set_model(self._ollama_model)
+        self.chat_panel.set_host(self._ollama_host)
+        self._save_ollama_settings()
+        self.status.showMessage(
+            f"Ollama: model={self._ollama_model}  host={self._ollama_host}"
+        )
+
+    # ------------------------------------------------------------------
 
     def _build_menu(self):
         menubar = self.menuBar()
@@ -821,6 +1110,13 @@ class MainWindow(QMainWindow):
         save_as_action = QAction("Save Project As...", self)
         save_as_action.triggered.connect(self._save_project_as)
         file_menu.addAction(save_as_action)
+
+        file_menu.addSeparator()
+
+        ollama_action = QAction("Ollama Settings…", self)
+        ollama_action.setToolTip("Set the Ollama chat model and server URL")
+        ollama_action.triggered.connect(self._configure_ollama)
+        file_menu.addAction(ollama_action)
 
     def _build_toolbar(self):
         toolbar = QToolBar("Tools")
@@ -866,6 +1162,26 @@ class MainWindow(QMainWindow):
         )
         auto_scale_btn.clicked.connect(self._auto_scale_page)
         toolbar.addWidget(auto_scale_btn)
+
+        toolbar.addSeparator()
+
+        self.chat_btn = QPushButton("Chat")
+        self.chat_btn.setCheckable(True)
+        self.chat_btn.setToolTip("Toggle Ollama chat panel")
+        self.chat_btn.clicked.connect(self._toggle_chat)
+        toolbar.addWidget(self.chat_btn)
+
+    def _toggle_chat(self):
+        splitter = self.chat_panel.parent()
+        if not isinstance(splitter, QSplitter):
+            return
+        sizes = splitter.sizes()
+        if sizes[2] < 10:
+            splitter.setSizes([sizes[0], sizes[1] - 320, 320])
+            self.chat_btn.setChecked(True)
+        else:
+            splitter.setSizes([sizes[0], sizes[1] + sizes[2], 0])
+            self.chat_btn.setChecked(False)
 
     def _build_statusbar(self):
         self.status = QStatusBar()
@@ -1065,6 +1381,15 @@ class MainWindow(QMainWindow):
         )
         self.status.showMessage(
             f"Viewing: {page_name}  |  Drag endpoints to adjust  •  Click to select  •  Delete to remove"
+        )
+
+        # Update chat context so the model knows which page is open
+        project_name = self._project.get("name", "") if self._project else ""
+        scale = self.viewer.get_scale()
+        scale_str = f"{scale:.6f} ft/px" if scale else "not set"
+        self.chat_panel.set_page_context(
+            f"Project: {project_name}  |  Page {page_index + 1} of "
+            f"{len(self._project['pages'])}: '{page_name}'  |  Scale: {scale_str}"
         )
 
     def _rename_page(self, index: int):
