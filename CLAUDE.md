@@ -39,6 +39,14 @@ The long-term goal is an AI-powered takeoff tool capable of semi-autonomous take
 2. User clicks start and end points on PDF
 3. App displays calculated real-world distance in feet
 
+## AI / Ollama Integration
+- Chat panel (right sidebar) uses `llama3.2` by default for text conversation
+- Vision model (`llava`) is used for Auto Name and Auto Scale fallback on image-only PDFs
+- **Chat panel is wired to llava vision** ✓ — when a page is loaded, the current page is rendered to PNG (2x / 144 DPI) and attached to every user message; the chat routes to `_ollama_vision_model` (llava) automatically, so the model sees exactly what the user sees
+- Model label in chat panel updates to show "Model: llava (vision)" when a page is active
+- All three Ollama settings (chat model, vision model, host URL) are persisted to `~/.megaswift_config.json`
+- Configurable via File → Ollama Settings…
+
 ## Future Work (V1.x)
 - Measurement lines persist after use (scale + dimension lines stay on screen) ✓
 - Labels showing measured distance displayed just above each line ✓

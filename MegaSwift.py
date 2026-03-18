@@ -782,6 +782,8 @@ class ChatPanel(QWidget):
 
         self.model = self.DEFAULT_MODEL
         self.host  = self.DEFAULT_HOST
+        self._vision_model = "llava"
+        self._page_image_bytes: bytes | None = None
 
         self._build_ui()
 
@@ -855,6 +857,19 @@ class ChatPanel(QWidget):
     def set_host(self, host: str):
         self.host = host
 
+    def set_vision_model(self, model: str):
+        self._vision_model = model
+        if self._page_image_bytes:
+            self._model_label.setText(f"Model: {self._vision_model} (vision)")
+
+    def set_page_image(self, img_bytes: "bytes | None"):
+        """Store the current page as PNG bytes so the vision model can see it."""
+        self._page_image_bytes = img_bytes
+        if img_bytes:
+            self._model_label.setText(f"Model: {self._vision_model} (vision)")
+        else:
+            self._model_label.setText(f"Model: {self.model}")
+
     def _system_prompt(self) -> str:
         base = (
             "You are an expert civil engineering plan reviewer embedded inside MegaSwift, "
@@ -904,7 +919,14 @@ class ChatPanel(QWidget):
 
         messages = [{"role": "system", "content": self._system_prompt()}] + self._history
 
-        self._worker = OllamaChatWorker(messages, self.model, self.host)
+        # If a page image is available, attach it to the current user message
+        # and route to the vision model (llava) so it can see the plan.
+        active_model = self.model
+        if self._page_image_bytes:
+            messages = messages[:-1] + [{**messages[-1], "images": [self._page_image_bytes]}]
+            active_model = self._vision_model
+
+        self._worker = OllamaChatWorker(messages, active_model, self.host)
         self._thread = QThread()
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
@@ -1074,6 +1096,7 @@ class MainWindow(QMainWindow):
         # Apply persisted Ollama settings to the chat panel
         self.chat_panel.set_model(self._ollama_model)
         self.chat_panel.set_host(self._ollama_host)
+        self.chat_panel.set_vision_model(self._ollama_vision_model)
 
     # ------------------------------------------------------------------
     # Ollama settings persistence
@@ -1139,6 +1162,7 @@ class MainWindow(QMainWindow):
         self._ollama_host         = host.strip()         or ChatPanel.DEFAULT_HOST
         self.chat_panel.set_model(self._ollama_model)
         self.chat_panel.set_host(self._ollama_host)
+        self.chat_panel.set_vision_model(self._ollama_vision_model)
         self._save_ollama_settings()
         self.status.showMessage(
             f"Ollama: chat={self._ollama_model}  vision={self._ollama_vision_model}  host={self._ollama_host}"
@@ -1451,6 +1475,17 @@ class MainWindow(QMainWindow):
             f"Project: {project_name}  |  Page {page_index + 1} of "
             f"{len(self._project['pages'])}: '{page_name}'  |  Scale: {scale_str}"
         )
+
+        # Render the page to PNG bytes so the vision model can see it in chat
+        if self._pdf_doc:
+            try:
+                fitz_page = self._pdf_doc[page_index]
+                pix = fitz_page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                self.chat_panel.set_page_image(pix.tobytes("png"))
+            except Exception:
+                self.chat_panel.set_page_image(None)
+        else:
+            self.chat_panel.set_page_image(None)
 
     def _rename_page(self, index: int):
         if not self._project:
